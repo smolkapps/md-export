@@ -55,6 +55,10 @@ pub struct RenderOptions {
     pub theme: Theme,
     /// Emit a table of contents built from the document headings.
     pub toc: bool,
+    /// Deepest heading level (1–6) to include in the table of contents.
+    /// Headings deeper than this are omitted from the TOC (they still get
+    /// their anchor `id` in the body). Only meaningful when `toc` is `true`.
+    pub toc_depth: u8,
     /// Wrap the rendered body in a full `<!doctype html>` document.
     /// When `false`, only the HTML fragment (body) is returned.
     pub standalone: bool,
@@ -70,6 +74,7 @@ impl Default for RenderOptions {
             fallback_title: "Document".to_string(),
             theme: Theme::Auto,
             toc: false,
+            toc_depth: 6,
             standalone: true,
             style: true,
         }
@@ -241,7 +246,13 @@ fn render_body(markdown: &str, options: &RenderOptions) -> (String, Option<Strin
     format_html(root, &comrak_opts, &mut html).expect("formatting HTML into a String cannot fail");
 
     let body = if options.toc {
-        let toc = render_toc(&headings);
+        // Only headings at or above the configured depth appear in the TOC;
+        // every heading still keeps its anchor `id` in the rendered body.
+        let selected: Vec<Heading> = headings
+            .into_iter()
+            .filter(|h| h.level <= options.toc_depth)
+            .collect();
+        let toc = render_toc(&selected);
         format!("{toc}{html}")
     } else {
         html
@@ -556,6 +567,68 @@ mod tests {
         let html = render("## Dup\n\n## Dup\n", &opts);
         assert!(html.contains("href=\"#dup\""), "no link to dup: {html}");
         assert!(html.contains("href=\"#dup-1\""), "no link to dup-1: {html}");
+    }
+
+    #[test]
+    fn toc_depth_omits_headings_deeper_than_limit() {
+        let opts = RenderOptions {
+            toc: true,
+            toc_depth: 2,
+            ..light_standalone()
+        };
+        let html = render(
+            "# Top\n\n## Shown\n\n### Hidden Deep\n\n#### Also Hidden\n",
+            &opts,
+        );
+        // TOC list items carry a `<li class="toc-lN">` per heading level; match
+        // that exact markup so we don't collide with the `toc-lN` CSS selectors
+        // in the <style> block or the heading anchors comrak emits in the body.
+        assert!(
+            html.contains("<li class=\"toc-l1\">") && html.contains("<li class=\"toc-l2\">"),
+            "levels within limit missing from toc: {html}"
+        );
+        // Deeper levels are absent from the TOC...
+        assert!(
+            !html.contains("<li class=\"toc-l3\">") && !html.contains("<li class=\"toc-l4\">"),
+            "deep heading leaked into toc: {html}"
+        );
+        // ...but still carry their anchor id in the body.
+        assert!(
+            html.contains("id=\"hidden-deep\""),
+            "deep heading lost its body id: {html}"
+        );
+    }
+
+    #[test]
+    fn toc_depth_default_includes_all_levels() {
+        let opts = RenderOptions {
+            toc: true,
+            ..light_standalone()
+        };
+        let html = render("# A\n\n###### Deep Six\n", &opts);
+        assert!(
+            html.contains("href=\"#deep-six\""),
+            "default depth dropped a level-6 heading: {html}"
+        );
+    }
+
+    #[test]
+    fn toc_depth_one_keeps_only_top_level() {
+        let opts = RenderOptions {
+            toc: true,
+            toc_depth: 1,
+            ..light_standalone()
+        };
+        let html = render("# Only Me\n\n## Not In Toc\n", &opts);
+        assert!(html.contains("class=\"toc\""), "no toc nav: {html}");
+        assert!(
+            html.contains("<li class=\"toc-l1\">"),
+            "top-level heading missing from toc: {html}"
+        );
+        assert!(
+            !html.contains("<li class=\"toc-l2\">"),
+            "level-2 heading leaked into depth-1 toc: {html}"
+        );
     }
 
     #[test]

@@ -41,6 +41,11 @@ struct Cli {
     #[arg(long)]
     toc: bool,
 
+    /// Deepest heading level (1–6) to include in the table of contents.
+    /// Only has an effect together with --toc.
+    #[arg(long, value_parser = parse_toc_depth, default_value = "6")]
+    toc_depth: u8,
+
     /// Emit a bare HTML fragment (no <html>/<head> wrapper, no CSS).
     #[arg(long, conflicts_with_all = ["standalone"])]
     no_style: bool,
@@ -53,6 +58,14 @@ struct Cli {
 /// clap value parser for `--theme`.
 fn parse_theme(s: &str) -> Result<Theme, String> {
     Theme::parse(s).ok_or_else(|| format!("invalid theme '{s}' (expected light, dark, or auto)"))
+}
+
+/// clap value parser for `--toc-depth`: an integer in the range 1–6.
+fn parse_toc_depth(s: &str) -> Result<u8, String> {
+    match s.parse::<u8>() {
+        Ok(n @ 1..=6) => Ok(n),
+        _ => Err(format!("invalid toc-depth '{s}' (expected an integer 1–6)")),
+    }
 }
 
 /// Derive the fallback title from the input path's file stem, or "Document".
@@ -113,6 +126,7 @@ fn main() -> Result<()> {
         fallback_title,
         theme: cli.theme,
         toc: cli.toc,
+        toc_depth: cli.toc_depth,
         // --no-style implies a bare fragment; otherwise a full standalone doc.
         standalone: !cli.no_style,
         style: !cli.no_style,
