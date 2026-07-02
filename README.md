@@ -74,8 +74,9 @@ let opts = RenderOptions { toc: true, theme: Theme::Dark, ..Default::default() }
 let html = render("# Hello\n\nworld\n", &opts);
 ```
 
-`render` is pure (Markdown string + options → HTML string); `slugify`,
-`render_toc`, and `theme_css` are also public.
+`render` is pure (Markdown string + options → HTML string); `render_toc`,
+`theme_css`, and a re-export of comrak's `Anchorizer` (used to keep TOC
+links byte-identical to the heading `id`s) are also public.
 
 ## Example
 

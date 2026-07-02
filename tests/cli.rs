@@ -133,6 +133,19 @@ fn invalid_toc_depth_is_rejected() {
 }
 
 #[test]
+fn toc_with_no_headings_warns_on_stderr() {
+    // --toc on a heading-less document: succeed, emit no <nav>, but tell the
+    // user why on stderr rather than silently producing nothing.
+    bin()
+        .arg("--toc")
+        .write_stdin("just a paragraph, no headings\n")
+        .assert()
+        .success()
+        .stdout(contains("class=\"toc\"").not())
+        .stderr(contains("selected no headings"));
+}
+
+#[test]
 fn no_style_emits_bare_fragment() {
     bin()
         .arg("--no-style")
