@@ -7,11 +7,16 @@
 //! set of [`RenderOptions`] and returns an HTML string. All work is local;
 //! there is no network or filesystem access in this module.
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 
+use comrak::html::collect_text;
 use comrak::nodes::{AstNode, NodeValue};
 use comrak::{format_html, parse_document, Arena, Options};
+
+/// Re-export of comrak's own header anchorizer. TOC slugs are generated with
+/// this exact type so every `href` we emit is byte-identical to the `id`
+/// comrak writes on the corresponding heading — see [`collect_headings`].
+pub use comrak::html::Anchorizer;
 
 /// Color theme for the embedded stylesheet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +60,10 @@ pub struct RenderOptions {
     pub theme: Theme,
     /// Emit a table of contents built from the document headings.
     pub toc: bool,
+    /// Deepest heading level (1–6) to include in the table of contents.
+    /// Headings deeper than this are omitted from the TOC (they still get
+    /// their anchor `id` in the body). Only meaningful when `toc` is `true`.
+    pub toc_depth: u8,
     /// Wrap the rendered body in a full `<!doctype html>` document.
     /// When `false`, only the HTML fragment (body) is returned.
     pub standalone: bool,
@@ -70,6 +79,7 @@ impl Default for RenderOptions {
             fallback_title: "Document".to_string(),
             theme: Theme::Auto,
             toc: false,
+            toc_depth: 6,
             standalone: true,
             style: true,
         }
@@ -85,55 +95,6 @@ pub struct Heading {
     pub text: String,
     /// Anchor id, matching the `id` attribute comrak emits on the heading.
     pub slug: String,
-}
-
-/// Slugify a single heading's text the same way comrak does when
-/// `header_id_prefix` is enabled, so generated TOC links match the `id`
-/// attributes in the rendered HTML.
-///
-/// Algorithm (reverse-engineered and verified against comrak 0.52):
-/// for each character — keep Unicode alphanumerics and `_` (lowercased);
-/// map a space or `-` to `-`; drop everything else (including tabs and
-/// punctuation). No collapsing of consecutive dashes, no trimming.
-pub fn slugify(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if ch.is_alphanumeric() || ch == '_' {
-            out.extend(ch.to_lowercase());
-        } else if ch == ' ' || ch == '-' {
-            out.push('-');
-        }
-        // all other characters are dropped
-    }
-    out
-}
-
-/// Disambiguate slugs exactly as comrak does: the first occurrence keeps the
-/// base slug; later collisions get `-1`, `-2`, … appended.
-fn dedup_slug(base: &str, seen: &mut HashMap<String, usize>) -> String {
-    match seen.get_mut(base) {
-        None => {
-            seen.insert(base.to_string(), 0);
-            base.to_string()
-        }
-        Some(count) => {
-            *count += 1;
-            format!("{base}-{count}")
-        }
-    }
-}
-
-/// Recursively collect the visible text of a node (heading content), flattening
-/// inline formatting. Code spans contribute their literal text.
-fn collect_text<'a>(node: &'a AstNode<'a>, out: &mut String) {
-    for child in node.children() {
-        match &child.data.borrow().value {
-            NodeValue::Text(t) => out.push_str(t),
-            NodeValue::Code(c) => out.push_str(&c.literal),
-            NodeValue::SoftBreak | NodeValue::LineBreak => out.push(' '),
-            _ => collect_text(child, out),
-        }
-    }
 }
 
 /// Build comrak options with the GFM feature set this tool supports enabled.
@@ -158,22 +119,30 @@ fn comrak_options() -> Options<'static> {
 fn collect_headings<'a>(root: &'a AstNode<'a>) -> (Vec<Heading>, Option<String>) {
     let mut headings = Vec::new();
     let mut first_h1: Option<String> = None;
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    // Drive comrak's own Anchorizer over the headings in document order, which
+    // is exactly what comrak's HTML formatter does internally when it stamps
+    // heading `id`s. Same algorithm + same inputs in the same order => every
+    // slug here is byte-identical to the body `id`, including the HashSet
+    // retry-loop disambiguation for duplicates ("Dup"/"Dup" -> dup, dup-1) and
+    // Unicode-correct lowercasing (Greek final sigma, NFD combining marks, \p{Pc}).
+    let mut anchorizer = Anchorizer::new();
 
     for node in root.descendants() {
         let level = match &node.data.borrow().value {
             NodeValue::Heading(h) => h.level,
             _ => continue,
         };
-        let mut text = String::new();
-        collect_text(node, &mut text);
-        let text = text.trim().to_string();
+        // Feed the Anchorizer the *exact* text comrak feeds its own (untrimmed
+        // `collect_text`), so the suffix bookkeeping stays in lockstep. The
+        // trimmed form is only for display in the TOC and title inference.
+        let raw = collect_text(node);
+        let slug = anchorizer.anchorize(&raw);
+        let text = raw.trim().to_string();
 
         if level == 1 && first_h1.is_none() && !text.is_empty() {
             first_h1 = Some(text.clone());
         }
 
-        let slug = dedup_slug(&slugify(&text), &mut seen);
         headings.push(Heading { level, text, slug });
     }
 
@@ -241,7 +210,24 @@ fn render_body(markdown: &str, options: &RenderOptions) -> (String, Option<Strin
     format_html(root, &comrak_opts, &mut html).expect("formatting HTML into a String cannot fail");
 
     let body = if options.toc {
-        let toc = render_toc(&headings);
+        // Validate the depth at the library boundary. The CLI already enforces
+        // 1–6, but a direct library caller can pass anything through the public
+        // `RenderOptions`; clamp so a stray 0 doesn't silently drop every
+        // heading and a value >6 doesn't over-promise levels that can't exist.
+        let depth = options.toc_depth.clamp(1, 6);
+        // Only headings at or above the configured depth appear in the TOC;
+        // every heading still keeps its anchor `id` in the rendered body.
+        let selected: Vec<Heading> = headings.into_iter().filter(|h| h.level <= depth).collect();
+        if selected.is_empty() {
+            // A TOC was requested but matched nothing (no headings, or all of
+            // them deeper than the limit). Warn on stderr rather than emitting
+            // an empty <nav>, so the user knows why it's missing.
+            eprintln!(
+                "md-export: --toc selected no headings (none at level 1–{depth}); \
+                 table of contents omitted"
+            );
+        }
+        let toc = render_toc(&selected);
         format!("{toc}{html}")
     } else {
         html
@@ -430,34 +416,88 @@ mod tests {
         }
     }
 
-    #[test]
-    fn slugify_matches_comrak_basic() {
-        assert_eq!(slugify("Foo Bar"), "foo-bar");
-        assert_eq!(slugify("Mixed CASE Title"), "mixed-case-title");
+    /// Pull the ordered list of `#`-prefixed link targets from the TOC nav
+    /// (and only the nav — heading anchors elsewhere carry `class="anchor"`).
+    fn extract_toc_hrefs(html: &str) -> Vec<String> {
+        let start = html.find("<nav class=\"toc\"").expect("no toc nav");
+        let end = html[start..].find("</nav>").expect("unterminated toc nav") + start;
+        let nav = &html[start..end];
+        let mut out = Vec::new();
+        let mut rest = nav;
+        while let Some(pos) = rest.find("href=\"#") {
+            let after = &rest[pos + "href=\"#".len()..];
+            let close = after.find('"').expect("unterminated href");
+            out.push(after[..close].to_string());
+            rest = &after[close..];
+        }
+        out
+    }
+
+    /// Pull the ordered list of heading anchor `id`s from the rendered body.
+    fn extract_heading_ids(html: &str) -> Vec<String> {
+        let needle = "class=\"anchor\" id=\"";
+        let mut out = Vec::new();
+        let mut rest = html;
+        while let Some(pos) = rest.find(needle) {
+            let after = &rest[pos + needle.len()..];
+            let close = after.find('"').expect("unterminated id");
+            out.push(after[..close].to_string());
+            rest = &after[close..];
+        }
+        out
     }
 
     #[test]
-    fn slugify_matches_comrak_punctuation() {
-        // Verified against comrak 0.52 output.
-        assert_eq!(slugify("Foo & Bar (baz)!"), "foo--bar-baz");
-        assert_eq!(slugify("Hello, World -- Test"), "hello-world----test");
-        assert_eq!(slugify("100% Done"), "100-done");
-        assert_eq!(slugify("a.b.c"), "abc");
-        assert_eq!(slugify("+ plus start"), "-plus-start");
+    fn toc_hrefs_correspond_per_heading_to_body_ids() {
+        let opts = RenderOptions {
+            toc: true,
+            ..light_standalone()
+        };
+        // Every case where a hand-rolled slugifier drifts from comrak's
+        // Anchorizer: a "Step N"-style heading whose base slug collides with a
+        // *different* heading's dedup suffix, duplicate headings, NFD combining
+        // marks ("Café" = e + U+0301), and Greek (whole-string lowercasing).
+        let md = "\
+## Dup 1
+## Dup
+## Dup
+## Step 1
+## Step 1
+## Cafe\u{301} Menu
+## Ελληνικά
+";
+        let html = render(md, &opts);
+
+        let hrefs = extract_toc_hrefs(&html);
+        let ids = extract_heading_ids(&html);
+
+        // All seven headings are level-2 and within the default depth, so the
+        // TOC must list exactly one entry per heading, in document order.
         assert_eq!(
-            slugify("under_score and dash-dash"),
-            "under_score-and-dash-dash"
+            hrefs.len(),
+            ids.len(),
+            "toc entry count != heading count\nhrefs={hrefs:?}\nids={ids:?}\n{html}"
         );
-    }
+        assert_eq!(ids.len(), 7, "unexpected heading count: {ids:?}\n{html}");
 
-    #[test]
-    fn slugify_keeps_unicode_letters() {
-        assert_eq!(slugify("café déjà vu"), "café-déjà-vu");
-    }
+        // The crux: entry i's href must target heading i's id — not merely
+        // appear *somewhere* in the document. This is what catches the
+        // duplicate-heading mis-linking bug (a link that jumps to the wrong
+        // section even though both the href and the id exist).
+        for (i, (href, id)) in hrefs.iter().zip(&ids).enumerate() {
+            assert_eq!(
+                href, id,
+                "heading {i}: toc href #{href} != body id #{id}\nhrefs={hrefs:?}\nids={ids:?}"
+            );
+        }
 
-    #[test]
-    fn slugify_drops_tabs() {
-        assert_eq!(slugify("Tabs\there"), "tabshere");
+        // Nail down the exact numbering comrak's HashSet retry loop produces:
+        // "Dup 1" claims `dup-1` first, so the *second* "Dup" cannot reuse it
+        // and rolls forward to `dup-2` (the old per-base counter wrongly reused
+        // `dup-1`, pointing the TOC link at the "Dup 1" heading).
+        assert_eq!(ids[0], "dup-1", "ids={ids:?}");
+        assert_eq!(ids[1], "dup", "ids={ids:?}");
+        assert_eq!(ids[2], "dup-2", "ids={ids:?}");
     }
 
     #[test]
@@ -556,6 +596,112 @@ mod tests {
         let html = render("## Dup\n\n## Dup\n", &opts);
         assert!(html.contains("href=\"#dup\""), "no link to dup: {html}");
         assert!(html.contains("href=\"#dup-1\""), "no link to dup-1: {html}");
+    }
+
+    #[test]
+    fn toc_depth_omits_headings_deeper_than_limit() {
+        let opts = RenderOptions {
+            toc: true,
+            toc_depth: 2,
+            ..light_standalone()
+        };
+        let html = render(
+            "# Top\n\n## Shown\n\n### Hidden Deep\n\n#### Also Hidden\n",
+            &opts,
+        );
+        // TOC list items carry a `<li class="toc-lN">` per heading level; match
+        // that exact markup so we don't collide with the `toc-lN` CSS selectors
+        // in the <style> block or the heading anchors comrak emits in the body.
+        assert!(
+            html.contains("<li class=\"toc-l1\">") && html.contains("<li class=\"toc-l2\">"),
+            "levels within limit missing from toc: {html}"
+        );
+        // Deeper levels are absent from the TOC...
+        assert!(
+            !html.contains("<li class=\"toc-l3\">") && !html.contains("<li class=\"toc-l4\">"),
+            "deep heading leaked into toc: {html}"
+        );
+        // ...but still carry their anchor id in the body.
+        assert!(
+            html.contains("id=\"hidden-deep\""),
+            "deep heading lost its body id: {html}"
+        );
+    }
+
+    #[test]
+    fn toc_depth_default_includes_all_levels() {
+        let opts = RenderOptions {
+            toc: true,
+            ..light_standalone()
+        };
+        let html = render("# A\n\n###### Deep Six\n", &opts);
+        assert!(
+            html.contains("href=\"#deep-six\""),
+            "default depth dropped a level-6 heading: {html}"
+        );
+    }
+
+    #[test]
+    fn toc_depth_one_keeps_only_top_level() {
+        let opts = RenderOptions {
+            toc: true,
+            toc_depth: 1,
+            ..light_standalone()
+        };
+        let html = render("# Only Me\n\n## Not In Toc\n", &opts);
+        assert!(html.contains("class=\"toc\""), "no toc nav: {html}");
+        assert!(
+            html.contains("<li class=\"toc-l1\">"),
+            "top-level heading missing from toc: {html}"
+        );
+        assert!(
+            !html.contains("<li class=\"toc-l2\">"),
+            "level-2 heading leaked into depth-1 toc: {html}"
+        );
+    }
+
+    #[test]
+    fn toc_depth_zero_is_clamped_not_silently_empty() {
+        // A library caller can bypass the CLI's 1–6 validation. `toc_depth: 0`
+        // must not drop every heading; it clamps up to depth 1.
+        let opts = RenderOptions {
+            toc: true,
+            toc_depth: 0,
+            ..light_standalone()
+        };
+        let html = render("# Top\n\n## Sub\n", &opts);
+        assert!(
+            html.contains("<li class=\"toc-l1\">"),
+            "toc_depth 0 dropped the top-level heading instead of clamping: {html}"
+        );
+    }
+
+    #[test]
+    fn toc_depth_above_six_is_clamped() {
+        // Values >6 clamp down to 6; a level-6 heading still appears.
+        let opts = RenderOptions {
+            toc: true,
+            toc_depth: 200,
+            ..light_standalone()
+        };
+        let html = render("# A\n\n###### Deep Six\n", &opts);
+        assert!(
+            html.contains("href=\"#deep-six\""),
+            "toc_depth clamp lost a valid level-6 heading: {html}"
+        );
+    }
+
+    #[test]
+    fn toc_requested_but_no_headings_emits_no_nav() {
+        let opts = RenderOptions {
+            toc: true,
+            ..light_standalone()
+        };
+        let html = render("just a paragraph, no headings\n", &opts);
+        assert!(
+            !html.contains("class=\"toc\""),
+            "emitted an empty toc nav for a heading-less document: {html}"
+        );
     }
 
     #[test]

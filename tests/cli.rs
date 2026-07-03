@@ -103,6 +103,49 @@ fn toc_flag_emits_nav_with_matching_anchors() {
 }
 
 #[test]
+fn toc_depth_limits_headings_in_nav() {
+    bin()
+        .arg("--toc")
+        .arg("--toc-depth")
+        .arg("2")
+        .write_stdin("# Top\n\n## Kept\n\n### Dropped\n")
+        .assert()
+        .success()
+        // TOC list items use `<li class="toc-lN">`; the level-3 heading is
+        // absent from the nav even though its body anchor id remains. (Matching
+        // the full markup avoids the `toc-lN` CSS selectors in the <style>.)
+        .stdout(contains("<li class=\"toc-l1\">"))
+        .stdout(contains("<li class=\"toc-l2\">"))
+        .stdout(contains("<li class=\"toc-l3\">").not())
+        .stdout(contains("id=\"dropped\""));
+}
+
+#[test]
+fn invalid_toc_depth_is_rejected() {
+    bin()
+        .arg("--toc")
+        .arg("--toc-depth")
+        .arg("9")
+        .write_stdin("# Hi\n")
+        .assert()
+        .failure()
+        .stderr(contains("invalid toc-depth"));
+}
+
+#[test]
+fn toc_with_no_headings_warns_on_stderr() {
+    // --toc on a heading-less document: succeed, emit no <nav>, but tell the
+    // user why on stderr rather than silently producing nothing.
+    bin()
+        .arg("--toc")
+        .write_stdin("just a paragraph, no headings\n")
+        .assert()
+        .success()
+        .stdout(contains("class=\"toc\"").not())
+        .stderr(contains("selected no headings"));
+}
+
+#[test]
 fn no_style_emits_bare_fragment() {
     bin()
         .arg("--no-style")
